@@ -3,6 +3,8 @@ package main
 /*
 TO DO:
 - Implement PDF parsing for arxiv_pdf.
+- Determine any other possible entry errors (i.e. not passing any cmd arguments).
+- Build binary and release on Homebrew (and possibly other) package managers.
 */
 
 import (
@@ -10,11 +12,18 @@ import (
     "fmt"
     "strings"
     "net/url"
+    "net/http"
     "time"
     "github.com/gocolly/colly"
     "sync"
     "github.com/jdkato/prose/v2"
     "github.com/fatih/color"
+    "io"
+    "os"
+    "github.com/unidoc/unipdf/v3/model"
+    "github.com/unidoc/unipdf/v3/extractor"
+    "github.com/google/uuid"
+    "path/filepath"
 )
 
 type ReadingResource struct {
@@ -64,7 +73,11 @@ func ValidateResource(r *ReadingResource) error {
             }
             
         case 2:
-            // ArXiV PDF's need to be extracted and processed as PDF  
+            if strings.Contains(path, "pdf") && host == "arxiv.org" {
+                r.ValidatedURL = *u
+            } else {
+                return err
+            }
 
         case 3:
             if strings.Contains(path, "html") && host == "arxiv.org" {
@@ -79,6 +92,31 @@ func ValidateResource(r *ReadingResource) error {
     }
 
     return nil
+}
+
+func DownloadPDF(url string, destinationFolder string) error {
+
+    // Check what to place in format method.
+    timestamp := time.Now().Format("20060102_150405")
+    id := uuid.New().String()[:8]
+    filename := fmt.Sprintf("%s_%s.pdf", id, timestamp)
+    
+    destination := filepath.Join(destinationFolder, filename)
+    
+    response, err := http.Get(url)
+    if err != nil {
+        return err
+    }
+    defer response.Body.Close()
+
+    out, err := os.Create(destination)
+    if err != nil {
+        return err
+    }
+    defer out.Close()
+
+    _, err = io.Copy(out, response.Body)
+    return err
 }
 
 func ScrapeResource(r *ReadingResource) error {
@@ -110,10 +148,67 @@ func ScrapeResource(r *ReadingResource) error {
             })
 
         case 2:
-            c.OnHTML("span", func(e *colly.HTMLElement) {
-                fmt.Println("Obtained text from ArXiV PDF: ", e.Text)
-                contentSlice = append(contentSlice, e.Text)
-            })
+            // Extract PDF from the URL.
+            // Testing with "tmp.pdf" temporary file
+            // Will place in batch folder...
+            err := os.MkdirAll("arxiv", os.ModePerm)
+            if err != nil {
+                return err
+            }
+
+            err = DownloadPDF(r.ValidatedURL.String(), "arxiv")
+            if err != nil {
+                return &ParseError{Message: err.Error()}
+            }
+
+            // Parse out text with unipdf (testing with single file).
+            // Further, these panics will be replaced by error accumulation.
+
+            entries, err := os.ReadDir("arxiv")
+            if err != nil {
+                return &ParseError{Message: err.Error()}
+            }
+            if len(entries) == 0 {
+                return &ParseError{Message: "No files found in arxiv folder."}
+            }
+
+            for _, entry := range entries {
+                if entry.IsDir() {
+                    continue
+                }
+                filename := entry.Name()
+                if filepath.Ext(filename) == ".pdf" {
+                    f, err := os.Open(filepath.Join("arxiv", filename))
+                    if err != nil {
+                        return &ParseError{Message: err.Error()}
+                    }
+                    defer f.Close()
+                    pdfReader, err := model.NewPdfReader(f)
+                    if err != nil {
+                        return &ParseError{Message: err.Error()}
+                    }
+                    numPages, err := pdfReader.GetNumPages()
+                    if err != nil {
+                        return &ParseError{Message: err.Error()}
+                    }
+
+                    for i := range numPages {
+                        page, err := pdfReader.GetPage(i + 1)
+                        if err != nil {
+                            return &ParseError{Message: err.Error()}
+                        }
+                        ex, err := extractor.New(page)
+                        if err != nil {
+                            return &ParseError{Message: err.Error()}
+                        }
+                        text, err := ex.ExtractText()
+                        if err != nil {
+                            return &ParseError{Message: err.Error()}
+                        }
+                        contentSlice = append(contentSlice, text)
+                    }  
+                }
+            } 
 
         default:
             return &ParseError{Message: "Invalid resource type."}
@@ -122,7 +217,6 @@ func ScrapeResource(r *ReadingResource) error {
     visitErr := c.Visit(r.ValidatedURL.String())
 
     // We have implicitly prioritised visitation errors over callback errors...
-    
     if visitErr != nil {
         return visitErr
     }
@@ -320,12 +414,12 @@ func main() {
         // Start a goroutine to scrape each resource
         go func(r ReadingResource) {  
             defer wg.Done()  
-            ScrapeResource(&resourceCopy)
-            AnalyseResource(&resourceCopy, wpm)
+            parseErr := ScrapeResource(&resourceCopy)
+            analyseErr := AnalyseResource(&resourceCopy, wpm)
+            errors = append(errors, parseErr, analyseErr)
             parsedResources = append(parsedResources, resourceCopy)
     }(resourceCopy)  
 }
-
     wg.Wait()
 
     fmt.Println("\n")
